@@ -202,57 +202,418 @@ Orchestrator: "감염관리위원회 소집 필요 → 자동 보고서 생성"
 
 ---
 
-## 4. 시스템 아키텍처
+## 4. 데이터 아키텍처 (CDC + FHIR 기반 실시간 COPY)
 
-### 4.1 기술 스택
-
-| 계층 | 기술 | 용도 |
-|:-----|:------|:------|
-| **Agent Framework** | LangChain / CrewAI / Custom | Agent 오케스트레이션 |
-| **LLM Backend** | Claude Code CLI + Ollama | Agent 추론/결정 |
-| **Data Layer** | PostgreSQL + Redis | 예측 데이터 + 캐싱 |
-| **Event Bus** | Redis Pub/Sub + Kafka | 실시간 이벤트 |
-| **Feature Store** | Feast / Custom | 통합 Feature 관리 |
-| **Model Registry** | MLflow | 모델 버전 관리 |
-| **API Gateway** | FastAPI + GraphQL | 통합 API |
-| **Dashboard** | React + D3.js + Grafana | 시각화 |
-| **Infra** | Docker + Kubernetes | 확장성 |
-
-### 4.2 디렉토리 구조
+### 4.1 핵심 원칙: 운영 DB 직접 조회 ❌ → CDC 실시간 COPY ✅
 
 ```
-hospital-agent/
-├── agent_framework/
-│   ├── base_agent.py        # Agent 기본 클래스
-│   ├── event_bus.py         # 이벤트 버스
-│   ├── orchestrator.py      # 오케스트레이터
-│   ├── knowledge_graph.py   # 지식 그래프
-│   └── message_queue.py     # 메시지 큐
-├── agents/
-│   ├── patient_flow/        # 환자 흐름 Agent
-│   ├── resource/            # 자원 관리 Agent
-│   ├── clinical_quality/    # 임상 질 Agent
-│   ├── financial/           # 재무 Agent
-│   ├── supply_chain/        # 공급망 Agent
-│   └── research/            # 연구 Agent
-├── models/
-│   ├── registry/            # 모델 저장소
-│   └── predictors/          # 개별 예측 모델
-├── shared/
-│   ├── feature_store/       # 통합 Feature Store
-│   ├── data_layer/          # EMR/OCS/LIS 연동
-│   └── schemas/             # 공통 데이터 스키마
-├── frontend/
-│   ├── dashboard/           # 통합 대시보드
-│   └── agent_control/       # Agent 제어판
-├── api/
-│   └── gateway.py           # 통합 API Gateway
-├── docker-compose.yml
-└── kubernetes/
-    └── agent-deployment.yaml
+                    병원 운영 시스템
+┌─────────────────────────────────────────────────────────────┐
+│  ⚕️ EMR DB     💊 OCS DB     🔬 LIS DB     🏥 행정 DB     │
+│  (Oracle)      (Oracle)      (MSSQL)       (PostgreSQL)    │
+└──────┬───────────┬─────────────┬──────────────┬────────────┘
+       │           │             │              │
+       │    CDC (Change Data Capture) — Debezium / Oracle GoldenGate
+       │           │             │              │
+       ▼           ▼             ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Kafka Event Bus (실시간 변경 이벤트)             │
+└─────────────────────────────────────────────────────────────┘
+       │
+       │    FHIR R4 변환 (표준화)
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              FHIR 표준화 레이어                               │
+│                                                              │
+│  • Patient → FHIR Patient Resource                           │
+│  • Encounter → FHIR Encounter Resource                       │
+│  • Observation → FHIR Observation Resource                   │
+│  • MedicationRequest → FHIR MedicationRequest Resource       │
+│  • Procedure → FHIR Procedure Resource                       │
+│  • DiagnosticReport → FHIR DiagnosticReport Resource         │
+│  • SNOMED CT / LOINC 매핑 (Snowstorm)                        │
+└─────────────────────────────────────────────────────────────┘
+       │
+       │    실시간 COPY
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Analytics Data Platform (읽기 전용 COPY)         │
+│                                                              │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+│  │ PostgreSQL │  │Elasticsearch│  │  Redis     │            │
+│  │ (구조화)   │  │ (검색)     │  │ (캐싱)     │            │
+│  └────────────┘  └────────────┘  └────────────┘            │
+│                                                              │
+│  ← 모든 Agent는 이 COPY만 READ (운영 DB 직접조회 ❌)          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Feature Store + ML Engine                        │
+│                                                              │
+│  • 예측 Feature 자동 생성                                     │
+│  • Model Inference (Prophet/XGBoost/LSTM)                    │
+│  • Agent 추론 (LLM)                                          │
+│  • 통합 대시보드                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 Agent Base Class
+### 4.2 CDC 파이프라인 상세
+
+```yaml
+# docker-compose.cdc.yml
+# CDC (Change Data Capture) — 운영 DB → 실시간 COPY
+services:
+  # 1. Kafka — CDC 이벤트 버스
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    environment:
+      KAFKA_TOPICS: "emr.patient,emr.encounter,ocs.prescription,lis.result"
+
+  # 2. Debezium Connectors — DB 변경 캡처
+  debezium-emr:
+    image: debezium/connector-oracle:latest
+    environment:
+      DB_HOST: ${EMR_HOST}
+      DB_PORT: 1521
+      DB_USER: ${EMR_CDC_USER}
+      DB_PASSWORD: ${EMR_CDC_PASS}
+      TOPIC_PREFIX: "emr"
+
+  debezium-ocs:
+    image: debezium/connector-oracle:latest
+    environment:
+      DB_HOST: ${OCS_HOST}
+      DB_PORT: 1521
+      TOPIC_PREFIX: "ocs"
+
+  debezium-lis:
+    image: debezium/connector-sqlserver:latest
+    environment:
+      DB_HOST: ${LIS_HOST}
+      DB_PORT: 1433
+      TOPIC_PREFIX: "lis"
+
+  # 3. FHIR 변환기 — CDC 이벤트 → FHIR Resource
+  fhir-transformer:
+    image: hapi-fhir/hapi-validator:latest
+    command: python fhir_transform.py
+    volumes:
+      - ./fhir/mapping:/app/mapping   # SNOMED/LOINC 매핑 파일
+
+  # 4. 실시간 COPY — FHIR Resource → Analytics DB
+  cdc-sync:
+    image: postgres:15
+    command: |
+      pg_ctl start
+      && pg_dump -h ${EMR_HOST} --data-only > /tmp/initial_copy.sql
+      && psql -d analytics_db < /tmp/initial_copy.sql
+      && LISTEN cdc_kafka FOR INSERT/UPDATE/DELETE
+```
+
+### 4.3 FHIR R4 표준화
+
+```python
+# shared/fhir/fhir_transformer.py
+
+class FHIRTransformer:
+    """원시 EMR 데이터 → FHIR R4 Resource 변환"""
+
+    SNOMED_MAP = {
+        'CBC': {'code': '26604007', 'system': 'http://snomed.info/sct'},
+        'LFT': {'code': '34557009', 'system': 'http://snomed.info/sct'},
+        'BUN': {'code': '59565001', 'system': 'http://snomed.info/sct'},
+        'CRP': {'code': '71415007', 'system': 'http://snomed.info/sct'},
+    }
+
+    LOINC_MAP = {
+        'CBC': '58410-2',
+        'GLU': '2345-7',
+        'HBA1C': '4548-4',
+    }
+
+    def to_patient_resource(self, emr_row: dict) -> dict:
+        """EMR 환자 정보 → FHIR Patient Resource"""
+        return {
+            'resourceType': 'Patient',
+            'id': emr_row['patient_id'],
+            'identifier': [{
+                'system': 'urn:oid:1.2.410.XXXX',
+                'value': emr_row['patient_id']
+            }],
+            'name': [{
+                'use': 'official',
+                'family': emr_row['name_last'],
+                'given': [emr_row['name_first']]
+            }],
+            'gender': emr_row['gender'],
+            'birthDate': emr_row['birth_date'],
+        }
+
+    def to_observation_resource(self, lab_result: dict) -> dict:
+        """LIS 검사 결과 → FHIR Observation Resource"""
+        loinc = self.LOINC_MAP.get(lab_result['test_code'])
+        snomed = self.SNOMED_MAP.get(lab_result['test_code'])
+        return {
+            'resourceType': 'Observation',
+            'id': lab_result['result_id'],
+            'status': 'final',
+            'code': {
+                'coding': [
+                    {'system': 'http://loinc.org', 'code': loinc},
+                    {'system': 'http://snomed.info/sct', 'code': snomed['code']},
+                ],
+                'text': lab_result['test_name']
+            },
+            'subject': {'reference': f"Patient/{lab_result['patient_id']}"},
+            'valueQuantity': {
+                'value': lab_result['result_value'],
+                'unit': lab_result['unit'],
+            },
+            'effectiveDateTime': lab_result['result_date'],
+        }
+
+    def to_encounter_resource(self, visit: dict) -> dict:
+        """진료 방문 → FHIR Encounter Resource"""
+        return {
+            'resourceType': 'Encounter',
+            'id': visit['visit_id'],
+            'status': 'finished',
+            'class': {
+                'system': 'http://terminology.hl7.org/CodeSystem/v3-ActCode',
+                'code': 'IMP' if visit['type'] == '입원' else 'AMB',
+                'display': visit['type'],
+            },
+            'subject': {'reference': f"Patient/{visit['patient_id']}"},
+            'period': {
+                'start': visit['admission_date'],
+                'end': visit.get('discharge_date'),
+            },
+            'diagnosis': [{
+                'condition': {'reference': f"Condition/{d['code']}"},
+            } for d in visit.get('diagnoses', [])],
+        }
+```
+
+### 4.4 실시간 COPY 프로세스
+
+```
+[운영 DB 변경 발생]
+    │
+    ▼
+[Oracle Redo Log / MSSQL Transaction Log]
+    │ ← Debezium이 변경분 캡처
+    ▼
+[Kafka Topic: emr.patient, emr.encounter, ocs.prescription, lis.result]
+    │
+    ▼
+[FHIR Transformer] ← 원시 데이터를 FHIR R4로 변환
+    │
+    ├──▶ [FHIR Validator] ← Snowstorm(SNOMED CT)으로 의미 검증
+    │       │
+    │       ├── ✅ 통과 → Analytics DB에 INSERT/UPDATE
+    │       └── ❌ 실패 → Dead Letter Queue + 운영자 알림
+    │
+    └──▶ [Elasticsearch] ← 검색 인덱싱
+    │
+    └──▶ [Feature Store] ← ML Feature 자동 갱신
+```
+
+### 4.5 초기 전체 COPY (첫 실행)
+
+```python
+# shared/data_layer/initial_load.py
+
+class InitialDataLoader:
+    """운영 DB → Analytics DB 최초 전체 COPY"""
+
+    TABLES = [
+        # EMR
+        ('emr', 'patients', 'SELECT * FROM patients'),
+        ('emr', 'admissions', 'SELECT * FROM admissions WHERE adm_date >= DATE_SUB(NOW(), INTERVAL 3 YEAR)'),
+        ('emr', 'diagnoses', 'SELECT * FROM diagnoses'),
+        ('emr', 'procedures', 'SELECT * FROM procedures'),
+        ('emr', 'vitals', 'SELECT * FROM vitals WHERE record_date >= DATE_SUB(NOW(), INTERVAL 1 YEAR)'),
+
+        # OCS
+        ('ocs', 'prescriptions', 'SELECT * FROM prescriptions WHERE order_date >= DATE_SUB(NOW(), INTERVAL 2 YEAR)'),
+        ('ocs', 'appointments', 'SELECT * FROM appointments WHERE apt_date >= DATE_SUB(NOW(), INTERVAL 1 YEAR)'),
+
+        # LIS
+        ('lis', 'lab_results', 'SELECT * FROM lab_results WHERE result_date >= DATE_SUB(NOW(), INTERVAL 2 YEAR)'),
+        ('lis', 'blood_bank', 'SELECT * FROM blood_bank'),
+
+        # 행정
+        ('admin', 'staff', 'SELECT * FROM staff'),
+        ('admin', 'departments', 'SELECT * FROM departments'),
+        ('admin', 'inventory', 'SELECT * FROM inventory'),
+    ]
+
+    def run_initial_load(self):
+        """운영 DB → Analytics DB 전체 복제"""
+        for source, table, query in self.TABLES:
+            print(f"📥 Copying {source}.{table}...")
+
+            # CDC 중단
+            self.pause_cdc()
+
+            # 전체 COPY (PostgreSQL Foreign Data Wrapper or pg_dump)
+            self.copy_table(source, table, query)
+
+            # CDC 재개 + 초기 스냅샷 이후 변경분 동기화
+            self.resume_cdc_with_lsn(table)
+
+        print("✅ 초기 전체 COPY 완료!")
+        print("🔁 CDC 실시간 동기화 시작")
+
+    def validate_copy(self) -> dict:
+        """복제 정합성 검증"""
+        results = {}
+        for source, table, _ in self.TABLES:
+            source_count = self.count_operational(source, table)
+            target_count = self.count_analytics(table)
+            match = '✅' if source_count == target_count else '❌'
+            results[table] = {'source': source_count, 'target': target_count, 'status': match}
+        return results
+```
+
+### 4.6 CDC 모니터링
+
+```python
+# shared/data_layer/cdc_monitor.py
+
+class CDCMonitor:
+    """CDC 상태 모니터링"""
+
+    def get_status(self) -> dict:
+        return {
+            'kafka_lag': self.get_kafka_consumer_lag(),
+            'debezium_uptime': self.check_connector_health(),
+            'last_sync_at': self.get_last_sync_time(),
+            'sync_lag_seconds': self.calculate_lag(),
+            'fhir_validation_errors': self.get_validation_error_count(),
+            'topics': {
+                'emr': {'messages_24h': self.topic_count('emr.*', '24h')},
+                'ocs': {'messages_24h': self.topic_count('ocs.*', '24h')},
+                'lis': {'messages_24h': self.topic_count('lis.*', '24h')},
+            }
+        }
+
+    def alert_on_lag(self, threshold_seconds: int = 60):
+        """CDC 지연 알림"""
+        lag = self.calculate_lag()
+        if lag > threshold_seconds:
+            self.send_alert(
+                severity='WARNING',
+                message=f"CDC 동기화 지연: {lag}s (허용: {threshold_seconds}s)"
+            )
+```
+
+### 4.7 보안: 운영 DB 직접 접근 금지
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    🚫 절대 금지                          │
+│  Agent가 운영 EMR/OCS/LIS DB를 직접 SELECT ❌          │
+│  Agent가 운영 DB에 직접 INSERT/UPDATE/DELETE ❌         │
+│                                                         │
+│  모든 Agent는 Analytics COPY DB만 READ ✅               │
+│  Agent의 액션(발주/알림)은 API Gateway를 통해서만 ✅     │
+└────────────────────────────────────────────────────────┘
+```
+
+| 구분 | 운영 DB | Analytics COPY DB |
+|:-----|:-------:|:-----------------:|
+| **목적** | 환자 진료/처방 | 분석/예측/AI |
+| **조회 주체** | EMR/OCS/LIS 사용자 | Agent 시스템 |
+| **데이터 기간** | 현재 + 최근 3개월 | 전체 (최대 3년) |
+| **변경 방식** | 실시간 트랜잭션 | Kafka CDC → READ ONLY |
+| **장애 영향** | Agent 장애가 운영에 영향 ❌ | COPY DB 장애 = 운영 영향 없음 ✅ |
+
+---
+
+## 5. FEATURE STORE (통합 Feature 관리)
+
+### 5.1 FHIR 기반 Feature 정의
+
+```python
+# shared/feature_store/fhir_features.py
+
+class FHIRFeatureProvider:
+    """FHIR Resource → ML Feature 변환"""
+
+    def get_patient_features(self, patient_id: str) -> dict:
+        """FHIR Patient + Observation → Feature"""
+        patient = self.fhir_client.read('Patient', patient_id)
+        observations = self.fhir_client.search('Observation', {
+            'subject': f'Patient/{patient_id}',
+            '_sort': '-date',
+            '_count': 100
+        })
+
+        return {
+            # Patient Resource 기반
+            'age': self._calc_age(patient.birthDate),
+            'gender': patient.gender,
+            'marital_status': patient.maritalStatus,
+
+            # Observation Resource 기반
+            'lab_count_30d': self._count_recent(observations, 30),
+            'abnormal_lab_ratio': self._abnormal_ratio(observations),
+
+            # Encounter Resource 기반
+            'visit_count_1y': self._count_encounters(patient_id, 365),
+            'hospitalization_days_1y': self._sum_los(patient_id, 365),
+        }
+```
+
+### 5.2 실시간 Feature 갱신
+
+```python
+# shared/feature_store/streaming.py
+
+class StreamingFeatureUpdater:
+    """CDC 이벤트 → Feature Store 실시간 갱신"""
+
+    def __init__(self, kafka_consumer, feature_store):
+        self.consumer = kafka_consumer
+        self.store = feature_store
+
+    async def start(self):
+        """Kafka CDC 이벤트 구독 → Feature 자동 갱신"""
+        async for message in self.consumer:
+            topic = message.topic
+            operation = message.key  # 'c'=CREATE, 'u'=UPDATE, 'd'=DELETE
+            resource = json.loads(message.value)
+
+            if topic == 'emr.encounter':
+                await self._update_encounter_features(resource)
+            elif topic == 'lis.result':
+                await self._update_lab_features(resource)
+            elif topic == 'ocs.prescription':
+                await self._update_prescription_features(resource)
+
+    async def _update_lab_features(self, observation: dict):
+        """LIS 결과 → 환자 Feature 갱신"""
+        patient_id = observation['subject']['reference'].split('/')[1]
+        feature_key = f"patient:{patient_id}:lab_last_24h"
+
+        # 24시간 내 검사 횟수 Feature 갱신
+        count = self.store.increment(feature_key, 1, ttl=86400)
+        if count > 10:  # 24시간 10건 초과 = 과다검사 플래그
+            await self.event_bus.emit(Event(
+                type=EventType.ANOMALY_DETECTED,
+                source='feature_store',
+                data={
+                    'type': 'excessive_testing',
+                    'patient_id': patient_id,
+                    'count_24h': count,
+                },
+                priority=1
+            ))
+
+
+### 5.3 Agent Base Class
 
 ```python
 # agent_framework/base_agent.py
@@ -267,39 +628,21 @@ class BaseAgent(ABC):
         self.event_bus = EventBus()
         self.memory = AgentMemory()
         self.llm = self._init_llm(llm_backend)
-        self.projects: list[str] = []  # 담당 프로젝트 IDs
+        self.projects: list[str] = []
         self.status = AgentStatus.IDLE
     
     @abstractmethod
     async def analyze(self, context: dict) -> dict:
-        """주기적 분석 실행"""
         pass
     
     @abstractmethod
     async def handle_event(self, event: Event):
-        """이벤트 처리"""
         pass
     
     async def call_agent(self, target: str, action: str, **kwargs):
-        """다른 Agent 호출 (RPC)"""
         return await self.event_bus.rpc_call(target, action, kwargs)
-    
-    def log(self, message: str, level: str = "INFO"):
-        """Agent 로깅"""
-        logger.info(f"[{self.agent_id}] {message}")
-    
-    def get_metrics(self) -> dict:
-        """Agent 상태 메트릭"""
-        return {
-            'agent_id': self.agent_id,
-            'status': self.status.value,
-            'projects': self.projects,
-            'predictions_today': self.memory.predictions_today,
-            'events_processed': len(self.memory.event_history),
-        }
-```
 
-### 4.4 Orchestrator
+### 5.4 Orchestrator
 
 ```python
 # agent_framework/orchestrator.py
@@ -314,145 +657,31 @@ class Orchestrator:
         self.conflict_resolver = ConflictResolver()
     
     def register_agent(self, agent: BaseAgent):
-        """Agent 등록"""
         self.agents[agent.agent_id] = agent
-        self.log(f"✅ Agent 등록: {agent.name} ({agent.agent_id})")
     
     async def run_daily_cycle(self):
-        """일일 자동 실행 사이클"""
         self.log("🔄 일일 Agent 사이클 시작")
-        
-        # 1. 모든 Agent 분석 실행
         results = {}
         for agent in self.agents.values():
             results[agent.agent_id] = await agent.analyze({
-                'date': today(),
-                'previous_results': results
+                'date': today(), 'previous_results': results
             })
-        
-        # 2. 충돌 감지 및 해결
         conflicts = self.detect_conflicts(results)
         for conflict in conflicts:
-            resolution = await self.conflict_resolver.resolve(conflict)
-            self.log(f"⚖️ 충돌 해결: {conflict.description} → {resolution}")
-        
-        # 3. 통합 보고서 생성
+            await self.conflict_resolver.resolve(conflict)
         report = await self.generate_integrated_report(results)
-        
-        # 4. 액션 실행
         actions = self.prioritize_actions(report['actions'])
-        for action in actions[:5]:  # 상위 5개만 실행
+        for action in actions[:5]:
             await self.execute_action(action)
-        
         self.log("✅ 일일 사이클 완료")
         return report
     
     def detect_conflicts(self, results: dict) -> list:
-        """Agent 간 추천 충돌 감지"""
         conflicts = []
-        # 예: 수술실 Agent vs 병상 Agent 충돌
-        or_recommendation = results.get('resource', {}).get('or_schedule', {})
-        bed_recommendation = results.get('patient_flow', {}).get('bed_plan', {})
-        # ... 충돌 감지 로직
+        or_schedule = results.get('resource', {}).get('or_schedule', {})
+        bed_plan = results.get('patient_flow', {}).get('bed_plan', {})
         return conflicts
 ```
-
----
-
-## 5. 데이터 흐름
-
-### 5.1 통합 Feature Store
-
-```python
-# shared/feature_store/feature_registry.py
-
-class FeatureRegistry:
-    """전 Agent 공유 Feature Store"""
-    
-    FEATURES = {
-        'patient_count': {
-            'description': '현재 입원 환자 수',
-            'source': 'EMR',
-            'update_freq': 'realtime',
-            'owners': ['patient_flow', 'resource'],
-        },
-        'bed_occupancy_rate': {
-            'description': '병상 가동률',
-            'source': 'EMR',
-            'update_freq': 'hourly',
-            'owners': ['patient_flow', 'resource'],
-        },
-        'ed_waiting_count': {
-            'description': '응급실 대기 환자 수',
-            'source': 'ED System',
-            'update_freq': 'realtime',
-            'owners': ['patient_flow'],
-        },
-        'or_utilization': {
-            'description': '수술실 가동률',
-            'source': 'OR System',
-            'update_freq': 'daily',
-            'owners': ['resource'],
-        },
-        'inventory_alert_count': {
-            'description': '재고 부족 경보 수',
-            'source': 'Inventory System',
-            'update_freq': 'realtime',
-            'owners': ['supply_chain'],
-        },
-        'infection_warnings': {
-            'description': '감염 의심 건수',
-            'source': 'LIS/EMR',
-            'update_freq': 'realtime',
-            'owners': ['clinical_quality'],
-        },
-        'claim_error_rate': {
-            'description': '진료비 청구 오류율',
-            'source': 'Billing System',
-            'update_freq': 'daily',
-            'owners': ['financial'],
-        },
-    }
-    
-    def get(self, feature_name: str) -> Any:
-        """Feature 조회"""
-        pass
-    
-    def subscribe(self, feature_name: str, callback: Callable):
-        """Feature 변경 구독"""
-        pass
-```
-
-### 5.2 데이터 수집기 (Data Collector)
-
-```python
-# shared/data_layer/collector.py
-
-class HospitalDataCollector:
-    """병원 데이터 통합 수집기"""
-    
-    SOURCES = {
-        'emr': EMRConnector(db_type='oracle'),
-        'lis': LISConnector(db_type='mssql'),
-        'ocs': OCSConnector(db_type='oracle'),
-        'nurse': NurseStationAPI(endpoint='...'),
-        'inventory': InventoryDB(),
-        'billing': BillingSystemAPI(),
-        'ed': EDSystemConnector(),
-    }
-    
-    async def collect_all(self) -> dict:
-        """전체 데이터 수집"""
-        data = {}
-        for name, source in self.SOURCES.items():
-            try:
-                data[name] = await source.fetch()
-            except Exception as e:
-                self.log(f"❌ {name} 수집 실패: {e}")
-        return data
-```
-
----
 
 ## 6. 배포 아키텍처
 
